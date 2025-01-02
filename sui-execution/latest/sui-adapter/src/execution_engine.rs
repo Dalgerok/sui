@@ -238,7 +238,7 @@ mod checked {
         protocol_config: &ProtocolConfig,
         metrics: Arc<LimitsMetrics>,
         move_vm: &Arc<MoveVM>,
-        tx_context: &mut TxContext,
+        tx_context: TxContext,
         input_objects: CheckedInputObjects,
         pt: ProgrammableTransaction,
     ) -> Result<InnerTemporaryStore, ExecutionError> {
@@ -257,7 +257,7 @@ mod checked {
             metrics,
             move_vm,
             &mut temporary_store,
-            tx_context.clone(),
+            tx_context,
             &mut gas_charger,
             pt,
         )?;
