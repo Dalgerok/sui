@@ -207,6 +207,7 @@ const MAX_PROTOCOL_VERSION: u64 = 72;
 // Version 72: Fix issue where `convert_type_argument_error` wasn't being used in all cases.
 //             Max gas budget moved to 50_000 SUI
 //             Max gas price moved to 50 SUI
+//             Native TxContext in Move.
 
 #[derive(Copy, Clone, Debug, Hash, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProtocolVersion(u64);
