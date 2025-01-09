@@ -14038,6 +14038,7 @@ dependencies = [
  "futures",
  "hex",
  "itertools 0.13.0",
+ "move-core-types",
  "rand 0.8.5",
  "serde",
  "sui-default-config",
