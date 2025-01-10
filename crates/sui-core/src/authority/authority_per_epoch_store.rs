@@ -66,8 +66,8 @@ use sui_types::sui_system_state::epoch_start_sui_system_state::{
 };
 use sui_types::transaction::{
     AuthenticatorStateUpdate, CertifiedTransaction, InputObjectKind, SenderSignedData, Transaction,
-    TransactionDataAPI, TransactionKey, TransactionKind, VerifiedCertificate,
-    VerifiedSignedTransaction, VerifiedTransaction,
+    TransactionKey, TransactionKind, VerifiedCertificate, VerifiedSignedTransaction,
+    VerifiedTransaction,
 };
 use tap::TapOptional;
 use tokio::sync::OnceCell;
@@ -309,10 +309,17 @@ pub struct AuthorityPerEpochStore {
 
     consensus_quarantine: RwLock<ConsensusOutputQuarantine>,
 
+    // shared version assignments is a DashMap because it is read from execution so we don't
+    // want contention.
     shared_version_assignments:
         DashMap<TransactionKey, Vec<(ConsensusObjectSequenceKey, SequenceNumber)>>,
+    // deferred transactions is only used by consensus handler so there should never be lock contention
+    // - hence no need for a DashMap.
     deferred_transactions: Mutex<BTreeMap<DeferralKey, Vec<VerifiedSequencedConsensusTransaction>>>,
-    user_signatures_for_checkpoints: RwLock<HashMap<TransactionDigest, Vec<GenericSignature>>>,
+
+    // user_signatures_for_checkpoints is written to by consensus handler and read from by checkpoint builder
+    // The critical sections are small in both cases so a DashMap is probably not helpful.
+    user_signatures_for_checkpoints: Mutex<HashMap<TransactionDigest, Vec<GenericSignature>>>,
 
     protocol_config: ProtocolConfig,
 
@@ -437,8 +444,7 @@ pub struct AuthorityEpochTables {
     next_shared_object_versions: DBMap<ObjectID, SequenceNumber>,
     next_shared_object_versions_v2: DBMap<ConsensusObjectSequenceKey, SequenceNumber>,
 
-    /// Deprecated table
-    #[allow(dead_code)]
+    // TODO: delete after DQ is rolled out
     pub(crate) pending_execution: DBMap<TransactionDigest, TrustedExecutableTransaction>,
 
     /// Track which transactions have been processed in handle_consensus_transaction. We must be
@@ -748,6 +754,15 @@ impl AuthorityEpochTables {
             .safe_iter()
             .collect::<Result<_, _>>()?)
     }
+
+    fn get_all_user_signatures_for_checkpoints(
+        &self,
+    ) -> SuiResult<HashMap<TransactionDigest, Vec<GenericSignature>>> {
+        Ok(self
+            .user_signatures_for_checkpoints
+            .safe_iter()
+            .collect::<Result<_, _>>()?)
+    }
 }
 
 pub(crate) const MUTEX_TABLE_SIZE: usize = 1024;
@@ -867,18 +882,26 @@ impl AuthorityPerEpochStore {
 
         let jwk_aggregator = Mutex::new(jwk_aggregator);
 
+        let shared_version_assignments =
+            Self::get_all_shared_version_assignments(&epoch_start_configuration, &tables)
+                .expect("load shared version assignments cannot fail");
+
         let deferred_transactions = tables
             .get_all_deferred_transactions()
             .expect("load deferred transactions cannot fail");
+
+        let user_signatures_for_checkpoints = tables
+            .get_all_user_signatures_for_checkpoints()
+            .expect("load user signatures for checkpoints cannot fail");
 
         let s = Arc::new(Self {
             name,
             committee,
             protocol_config,
             tables: ArcSwapOption::new(Some(Arc::new(tables))),
-            shared_version_assignments: Default::default(),
+            shared_version_assignments: shared_version_assignments.into_iter().collect(),
             deferred_transactions: Mutex::new(deferred_transactions),
-            user_signatures_for_checkpoints: Default::default(),
+            user_signatures_for_checkpoints: Mutex::new(user_signatures_for_checkpoints),
             consensus_quarantine: RwLock::new(ConsensusOutputQuarantine::new(
                 highest_executed_checkpoint,
             )),
@@ -1470,6 +1493,16 @@ impl AuthorityPerEpochStore {
         .await;
 
         Ok(result)
+    }
+
+    /// Gets all pending certificates. Used during recovery.
+    pub fn all_pending_execution(&self) -> SuiResult<Vec<VerifiedExecutableTransaction>> {
+        Ok(self
+            .tables()?
+            .pending_execution
+            .unbounded_iter()
+            .map(|(_, cert)| cert.into())
+            .collect())
     }
 
     /// Called when transaction outputs are committed to disk
@@ -4263,6 +4296,41 @@ impl AuthorityPerEpochStore {
                 ),
             }
         }
+    }
+
+    fn get_all_shared_version_assignments(
+        epoch_start_configuration: &EpochStartConfiguration,
+        tables: &AuthorityEpochTables,
+    ) -> SuiResult<
+        Vec<(
+            TransactionKey,
+            Vec<(ConsensusObjectSequenceKey, SequenceNumber)>,
+        )>,
+    > {
+        Ok(
+            if epoch_start_configuration.use_version_assignment_tables_v3() {
+                tables
+                    .assigned_shared_object_versions_v3
+                    .safe_iter()
+                    .collect::<Result<_, _>>()?
+            } else {
+                tables
+                    .assigned_shared_object_versions_v2
+                    .safe_iter()
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .map(|(key, value)| {
+                        (
+                            key,
+                            value
+                                .into_iter()
+                                .map(|(id, v)| ((id, SequenceNumber::UNKNOWN), v))
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect()
+            },
+        )
     }
 }
 
