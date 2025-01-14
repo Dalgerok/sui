@@ -11,6 +11,7 @@ use diesel_async::RunQueryDsl;
 use sui_pg_db::{self as db};
 use sui_types::full_checkpoint_content::CheckpointData;
 
+#[derive(Default)]
 pub struct CpSequenceNumbers;
 
 impl Processor for CpSequenceNumbers {
