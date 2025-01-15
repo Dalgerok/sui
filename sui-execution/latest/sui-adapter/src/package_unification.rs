@@ -1,30 +1,56 @@
+// Copyright (c) Mysten Labs, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 use move_binary_format::{binary_config::BinaryConfig, file_format::Visibility};
 use std::collections::BTreeMap;
 use sui_types::{
     base_types::{ObjectID, SequenceNumber},
+    error::{ExecutionError, ExecutionErrorKind, SuiResult, UserInputError},
     move_package::MovePackage,
     storage::BackingPackageStore,
     transaction::{Command, ProgrammableTransaction},
     type_input::TypeInput,
 };
 
+/// Max number of packages to cache in the PTBLinkageMetadata. If we have more than this, we'll
+/// drop the cache and restart the cache.
+const MAX_CACHED_PACKAGES: usize = 200;
+
+/// Metadata for the PTB linkage analysis.
 #[derive(Debug)]
 pub struct PTBLinkageMetadata {
+    /// Config to use for the linkage analysis.
     pub config: LinkageConfig,
+    /// Current unification table we have for packages. This is a mapping from the original
+    /// package ID for a package to its current resolution. This is the "constraint set" that we
+    /// are building/solving as we progress across the PTB.
     pub unification_table: BTreeMap<ObjectID, ConflictResolution>,
+    /// Cache for packages that we've loaded so far. Note: We may drop this cache if it grows too
+    /// large.
     pub all_packages: BTreeMap<ObjectID, MovePackage>,
 }
 
+/// Configuration for the linkage analysis.
 #[derive(Debug)]
 pub struct LinkageConfig {
+    /// Do we introduce an `Exact(<pkg_id>)` for each top-level function <pkg_id>::mname::fname?
     pub fix_top_level_functions: bool,
+    /// Do we introduce an `Exact(<pkg_id>)` for each type <pkg_id>::mname::tname?
     pub fix_types: bool,
+    /// Do we introduce an `Exact(<pkg_id>)` for each transitive dependency of a non-public entry function?
     pub exact_entry_transitive_deps: bool,
 }
 
+/// Unifiers. These are used to determine how to unify two packages.
 #[derive(Debug)]
 pub enum ConflictResolution {
+    /// An exact constraint unifies as follows:
+    /// 1. Exact(a) ~ Exact(b) ==> Exact(a), iff a == b
+    /// 2. Exact(a) ~ AtLeast(b) ==> Exact(a), iff a >= b
     Exact(SequenceNumber, ObjectID),
+    /// An at least constraint unifies as follows:
+    /// * AtLeast(a, a_version) ~ AtLeast(b, b_version) ==> AtLeast(x, max(a_version, b_version)),
+    ///   where x is the package id of either a or b (the one with the greatest version).
     AtLeast(SequenceNumber, ObjectID),
 }
 
@@ -75,14 +101,21 @@ impl ConflictResolution {
         ConflictResolution::AtLeast(pkg.version(), pkg.id())
     }
 
-    pub fn unify(&self, other: &ConflictResolution) -> anyhow::Result<ConflictResolution> {
+    pub fn unify(&self, other: &ConflictResolution) -> SuiResult<ConflictResolution> {
         match (&self, other) {
             // If we have two exact resolutions, they must be the same.
             (ConflictResolution::Exact(sv, self_id), ConflictResolution::Exact(ov, other_id)) => {
                 if self_id != other_id || sv != ov {
-                    return Err(anyhow::anyhow!(
-                        "UNIFICATION ERROR: Exact/exact conflicting resolutions for packages: {self_id}@{sv} and {other_id}@{ov}",
-                    ));
+                    return Err(
+                        ExecutionError::new_with_source(
+                            ExecutionErrorKind::InvalidUnifiedLinkage,
+                            format!(
+                                "exact/exact conflicting resolutions for package: linkage requires the same package \
+                                 at different versions. Linkage requires exactly {self_id} (version {sv}) and \
+                                 {other_id} (version {ov}) to be used in the same transaction"
+                            )
+                        ).into()
+                    );
                 } else {
                     Ok(ConflictResolution::Exact(*sv, *self_id))
                 }
@@ -114,9 +147,17 @@ impl ConflictResolution {
                 ConflictResolution::Exact(exact_version, exact_id),
             ) => {
                 if exact_version < at_least_version {
-                    return Err(anyhow::anyhow!(
-                        "UNIFICATION ERROR: Exact/at least Conflicting resolutions for packages: Exact {exact_id}@{exact_version} and {at_least_id}@{at_least_version}",
-                    ));
+                    return Err(
+                        ExecutionError::new_with_source(
+                            ExecutionErrorKind::InvalidUnifiedLinkage,
+                            format!(
+                                "Exact/AtLeast conflicting resolutions for package: linkage requires exactly this \
+                                 package {exact_id} (version {exact_version}) and also at least the following \
+                                 version of the package {at_least_id} at version {at_least_version}. However \
+                                 {exact_id} is at version {exact_version} which is less than {at_least_version}."
+                            )
+                        ).into()
+                    );
                 }
 
                 Ok(ConflictResolution::Exact(*exact_version, *exact_id))
@@ -131,7 +172,7 @@ impl PTBLinkageMetadata {
         store: &dyn BackingPackageStore,
         config: LinkageConfig,
         binary_config: &BinaryConfig,
-    ) -> anyhow::Result<Self> {
+    ) -> SuiResult<Self> {
         let mut linkage = PTBLinkageMetadata {
             unification_table: BTreeMap::new(),
             all_packages: BTreeMap::new(),
@@ -150,24 +191,26 @@ impl PTBLinkageMetadata {
         command: &Command,
         store: &dyn BackingPackageStore,
         binary_config: &BinaryConfig,
-    ) -> anyhow::Result<()> {
+    ) -> SuiResult<()> {
         match command {
             Command::MoveCall(programmable_move_call) => {
                 let pkg = self.get_package(&programmable_move_call.package, store)?;
 
-                let m = pkg
-                    .deserialize_module_by_name(&programmable_move_call.module, binary_config)
-                    .map_err(|e| anyhow::anyhow!("Error deserializing module: {:?}", e))?;
+                let m =
+                    pkg.deserialize_module_by_name(&programmable_move_call.module, binary_config)?;
                 let Some(fdef) = m.function_defs().into_iter().find(|f| {
                     m.identifier_at(m.function_handle_at(f.function).name)
                         .as_str()
                         == &programmable_move_call.function
                 }) else {
-                    return Err(anyhow::anyhow!(
-                        "Function {} not found in module {}",
-                        programmable_move_call.function,
-                        programmable_move_call.module
-                    ));
+                    return Err(ExecutionError::new_with_source(
+                        ExecutionErrorKind::FunctionNotFound,
+                        format!(
+                            "Function {} not found in module {}",
+                            programmable_move_call.function, programmable_move_call.module
+                        ),
+                    )
+                    .into());
                 };
 
                 let pkg_id = pkg.id();
@@ -222,7 +265,7 @@ impl PTBLinkageMetadata {
         Ok(())
     }
 
-    fn add_type(&mut self, ty: &TypeInput, store: &dyn BackingPackageStore) -> anyhow::Result<()> {
+    fn add_type(&mut self, ty: &TypeInput, store: &dyn BackingPackageStore) -> SuiResult<()> {
         let mut stack = vec![ty];
         while let Some(ty) = stack.pop() {
             match ty {
@@ -257,11 +300,20 @@ impl PTBLinkageMetadata {
         &mut self,
         object_id: &ObjectID,
         store: &dyn BackingPackageStore,
-    ) -> anyhow::Result<&MovePackage> {
+    ) -> SuiResult<&MovePackage> {
+        // If we've cached too many packages, clear the cache. We'll windup pulling in any more
+        // that we need if we need them again.
+        if self.all_packages.len() > MAX_CACHED_PACKAGES {
+            self.all_packages.clear();
+        }
+
         if !self.all_packages.contains_key(object_id) {
             let package = store
                 .get_package_object(object_id)?
-                .ok_or_else(|| anyhow::anyhow!("Object {} not found in any package", object_id))?
+                .ok_or_else(|| UserInputError::ObjectNotFound {
+                    object_id: *object_id,
+                    version: None,
+                })?
                 .move_package()
                 .clone();
             self.all_packages.insert(*object_id, package);
@@ -280,7 +332,7 @@ impl PTBLinkageMetadata {
         object_id: &ObjectID,
         store: &dyn BackingPackageStore,
         resolution_fn: fn(&MovePackage) -> ConflictResolution,
-    ) -> anyhow::Result<()> {
+    ) -> SuiResult<()> {
         let package = self.get_package(object_id, store)?;
 
         let resolution = resolution_fn(package);
