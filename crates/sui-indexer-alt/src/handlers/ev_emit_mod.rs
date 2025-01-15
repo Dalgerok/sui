@@ -73,9 +73,6 @@ impl Handler for EvEmitMod {
             end: to_tx,
         } = tx_interval(conn, from..to_exclusive).await?;
 
-        println!("from_tx: {}", from_tx);
-        println!("to_tx: {}", to_tx);
-
         let filter = ev_emit_mod::table
             .filter(ev_emit_mod::tx_sequence_number.between(from_tx as i64, to_tx as i64 - 1));
 
@@ -116,7 +113,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_no_events() {
+    async fn test_ev_emit_mod_no_events() {
         let (indexer, _db) = Indexer::new_for_testing(&MIGRATIONS).await;
         let mut conn = indexer.db().connect().await.unwrap();
         let ev_emit_mod = EvEmitMod::default();
@@ -135,7 +132,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_single_event() {
+    async fn test_ev_emit_mod_single_event() {
         let (indexer, _db) = Indexer::new_for_testing(&MIGRATIONS).await;
         let mut conn = indexer.db().connect().await.unwrap();
         let ev_emit_mod = EvEmitMod::default();
@@ -157,7 +154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_prune_events() {
+    async fn test_ev_emit_mod_prune_events() {
         let (indexer, _db) = Indexer::new_for_testing(&MIGRATIONS).await;
         let mut conn = indexer.db().connect().await.unwrap();
         let ev_emit_mod = EvEmitMod::default();

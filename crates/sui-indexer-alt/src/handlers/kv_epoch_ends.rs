@@ -19,6 +19,7 @@ use sui_types::{
     transaction::{TransactionDataAPI, TransactionKind},
 };
 
+#[derive(Default)]
 pub(crate) struct KvEpochEnds;
 
 impl Processor for KvEpochEnds {
@@ -148,5 +149,298 @@ impl Handler for KvEpochEnds {
         } else {
             Ok(0)
         }
+    }
+}
+
+/// kv_epoch_starts necessitates emulating a live network due to EndOfEpochData presence and a
+/// particular transaction kind, so these tests use Simulacrum instead of TestCheckpointDataBuilder.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::{ConcurrentLayer, IndexerConfig},
+        start_indexer,
+    };
+    use anyhow::Result;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use simulacrum::Simulacrum;
+    use std::{ops::Range, path::PathBuf, time::Duration};
+    use sui_indexer_alt_framework::{
+        ingestion::{ClientArgs, IngestionConfig},
+        models::cp_sequence_numbers::tx_interval,
+        pipeline::{
+            concurrent::{ConcurrentConfig, PrunerConfig},
+            CommitterConfig,
+        },
+        IndexerArgs,
+    };
+    use sui_pg_db::{
+        temp::{get_available_port, TempDb},
+        Connection, Db, DbArgs,
+    };
+    use tempfile::TempDir;
+    use tokio::{task::JoinHandle, time::timeout};
+    use tokio_util::sync::CancellationToken;
+
+    fn load_indexer_config() -> IndexerConfig {
+        let mut base_config = IndexerConfig::default();
+        base_config.ingestion = IngestionConfig {
+            checkpoint_buffer_size: 10,
+            ingest_concurrency: 2,
+            retry_interval_ms: 200,
+            ..Default::default()
+        }
+        .into();
+
+        base_config.committer = CommitterConfig {
+            write_concurrency: 2,
+            collect_interval_ms: 500,
+            watermark_interval_ms: 500,
+            ..Default::default()
+        }
+        .into();
+
+        base_config.pipeline.cp_sequence_numbers = ConcurrentLayer::default().into();
+        base_config.pipeline.kv_epoch_ends = Some(
+            ConcurrentConfig {
+                pruner: Some(
+                    PrunerConfig {
+                        interval_ms: 200,
+                        delay_ms: 100,
+                        retention: 10, // This is so we don't prune immediately after writing epoch end data
+                        max_chunk_size: 10,
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            }
+            .into(),
+        );
+        base_config
+    }
+
+    /// The TempDir and TempDb need to be kept alive for the duration of the test, otherwise parts of
+    /// the test env will hang indefinitely.
+    async fn setup_temp_resources() -> (TempDb, TempDir) {
+        let temp_db = TempDb::new().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        (temp_db, temp_dir)
+    }
+
+    async fn setup_test_env(
+        db_url: String,
+        data_ingestion_path: PathBuf,
+        indexer_config: IndexerConfig,
+    ) -> (
+        Simulacrum<StdRng>,
+        Db,
+        JoinHandle<anyhow::Result<()>>,
+        CancellationToken,
+    ) {
+        // Set up simulacrum
+        let rng = StdRng::from_seed([12; 32]);
+        let mut sim = Simulacrum::new_with_rng(rng);
+        sim.set_data_ingestion_path(data_ingestion_path.clone());
+
+        // Set up direct db pool for test assertions
+        let db = Db::for_write(DbArgs {
+            database_url: db_url.parse().unwrap(),
+            db_connection_pool_size: 1,
+            connection_timeout_ms: 60_000,
+        })
+        .await
+        .unwrap();
+
+        // Set up indexer
+        let db_args = DbArgs {
+            database_url: db_url.parse().unwrap(),
+            db_connection_pool_size: 10,
+            connection_timeout_ms: 60_000,
+        };
+
+        let prom_address = format!("127.0.0.1:{}", get_available_port())
+            .parse()
+            .unwrap();
+        let indexer_args = IndexerArgs {
+            metrics_address: prom_address,
+            ..Default::default()
+        };
+
+        let client_args = ClientArgs {
+            remote_store_url: None,
+            local_ingestion_path: Some(data_ingestion_path),
+        };
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        // Spawn the indexer in a separate task
+        let indexer_handle = tokio::spawn(async move {
+            start_indexer(
+                db_args,
+                indexer_args,
+                client_args,
+                indexer_config,
+                true,
+                Some(cancel_clone),
+            )
+            .await
+        });
+
+        (sim, db, indexer_handle, cancel)
+    }
+
+    /// Even though the indexer consists of several independent pipelines, the `cp_sequence_numbers`
+    /// table governs checkpoint -> tx and epoch lookups and provides such information for prunable
+    /// tables. This waits for the lookup table to be updated with the expected changes.
+    async fn wait_for_tx_interval(
+        conn: &mut Connection<'_>,
+        duration: Duration,
+        cp_range: Range<u64>,
+    ) -> anyhow::Result<()> {
+        timeout(duration, async {
+            loop {
+                match tx_interval(conn, cp_range.clone()).await {
+                    Ok(_) => break Ok(()),
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Timeout occurred while waiting for tx interval of checkpoints [{}, {})",
+                cp_range.start,
+                cp_range.end
+            )
+        })?
+    }
+
+    async fn get_all_kv_epoch_ends(conn: &mut Connection<'_>) -> Result<Vec<i64>> {
+        let result = kv_epoch_ends::table
+            .select(kv_epoch_ends::epoch)
+            .load(conn)
+            .await?;
+        Ok(result)
+    }
+
+    async fn wait_for_table_changes(
+        conn: &mut Connection<'_>,
+        duration: Duration,
+        epochs: Vec<i64>,
+    ) -> anyhow::Result<()> {
+        timeout(duration, async {
+            loop {
+                match get_all_kv_epoch_ends(conn).await {
+                    Ok(fetched_epochs) => {
+                        if fetched_epochs == epochs {
+                            break Ok(());
+                        }
+                    }
+                    Err(_) => {}
+                }
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Timeout occurred while waiting for table changes of epochs {:?}",
+                epochs
+            )
+        })?
+    }
+
+    async fn cleanup_test_env(
+        cancel: CancellationToken,
+        indexer_handle: JoinHandle<anyhow::Result<()>>,
+    ) {
+        cancel.cancel();
+        let _ = indexer_handle.await.expect("Indexer task panicked");
+    }
+
+    /// Test that the `cp_sequence_numbers` is correctly committed to.
+    #[tokio::test]
+    pub async fn test_kv_epoch_ends_advance_multiple_epochs() -> () {
+        let indexer_config = load_indexer_config();
+        let (temp_db, temp_dir) = setup_temp_resources().await;
+        let db_url = temp_db.database().url().as_str().to_owned();
+        let data_ingestion_path = temp_dir.path().to_path_buf();
+        let (mut sim, db, indexer_handle, cancel) =
+            setup_test_env(db_url, data_ingestion_path, indexer_config).await;
+        let kv_epoch_ends = KvEpochEnds::default();
+
+        // we start at epoch 0
+        sim.advance_epoch(true);
+        sim.advance_epoch(true);
+        sim.advance_epoch(true);
+        // and progress to epoch 3
+
+        let mut conn = db
+            .connect()
+            .await
+            .expect("Failed to retrieve DB connection");
+
+        if let Err(e) = wait_for_tx_interval(&mut conn, Duration::from_secs(5), 0..3).await {
+            cleanup_test_env(cancel, indexer_handle).await;
+            panic!("{:?}", e);
+        }
+
+        // This test is a bit different from kv_epoch_starts - due to the longer 10 chpkt retention, at this point all epochs should still be available.
+        if let Err(e) =
+            wait_for_table_changes(&mut conn, Duration::from_secs(15), vec![0, 1, 2]).await
+        {
+            cleanup_test_env(cancel, indexer_handle).await;
+            panic!("{:?}", e);
+        }
+
+        let rows_pruned = kv_epoch_ends.prune(0, 3, &mut conn).await.unwrap();
+        let epochs = get_all_kv_epoch_ends(&mut conn).await.unwrap();
+        assert_eq!(epochs, vec![2]);
+        assert_eq!(rows_pruned, 2);
+
+        cleanup_test_env(cancel, indexer_handle).await;
+    }
+
+    /// Epoch end table retention must be larger than one epoch's worth of checkpoints - otherwise
+    /// we'll prune the entry for the previous epoch at boundary shortly after writing it.
+    #[tokio::test]
+    pub async fn test_kv_epoch_ends_same_epoch() -> () {
+        let indexer_config = load_indexer_config();
+        let (temp_db, temp_dir) = setup_temp_resources().await;
+        let db_url = temp_db.database().url().as_str().to_owned();
+        let data_ingestion_path = temp_dir.path().to_path_buf();
+        let (mut sim, db, indexer_handle, cancel) =
+            setup_test_env(db_url, data_ingestion_path, indexer_config).await;
+
+        sim.create_checkpoint();
+        sim.create_checkpoint();
+        sim.advance_epoch(true);
+        sim.create_checkpoint();
+        sim.create_checkpoint();
+        sim.create_checkpoint();
+
+        let mut conn = db
+            .connect()
+            .await
+            .expect("Failed to retrieve DB connection");
+
+        // Assert that we didn't write epoch 1, still have epoch 0 because within retention.
+        if let Err(e) = wait_for_table_changes(&mut conn, Duration::from_secs(5), vec![0]).await {
+            cleanup_test_env(cancel, indexer_handle).await;
+            panic!("{:?}", e);
+        }
+
+        // Once we've reached the expected state, manually attempt to prune. Data will be pruned.
+        let kv_epoch_ends = KvEpochEnds::default();
+        let rows_pruned = kv_epoch_ends.prune(0, 4, &mut conn).await.unwrap();
+        let epochs = get_all_kv_epoch_ends(&mut conn).await.unwrap();
+        assert_eq!(epochs, Vec::<i64>::new());
+        assert_eq!(rows_pruned, 1);
+
+        cleanup_test_env(cancel, indexer_handle).await;
     }
 }

@@ -14,6 +14,7 @@ use sui_indexer_alt_schema::{events::StoredEvStructInst, schema::ev_struct_inst}
 use sui_pg_db as db;
 use sui_types::full_checkpoint_content::CheckpointData;
 
+#[derive(Default)]
 pub(crate) struct EvStructInst;
 
 impl Processor for EvStructInst {
@@ -80,5 +81,126 @@ impl Handler for EvStructInst {
             .filter(ev_struct_inst::tx_sequence_number.between(from_tx as i64, to_tx as i64 - 1));
 
         Ok(diesel::delete(filter).execute(conn).await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diesel_async::RunQueryDsl;
+    use sui_indexer_alt_framework::handlers::cp_sequence_numbers::CpSequenceNumbers;
+    use sui_indexer_alt_framework::Indexer;
+    use sui_indexer_alt_schema::MIGRATIONS;
+    use sui_types::event::Event;
+    use sui_types::test_checkpoint_data_builder::TestCheckpointDataBuilder;
+
+    async fn get_all_ev_struct_inst(
+        conn: &mut db::Connection<'_>,
+    ) -> Result<Vec<StoredEvStructInst>> {
+        let query = ev_struct_inst::table.load(conn).await?;
+        Ok(query)
+    }
+
+    #[tokio::test]
+    async fn test_ev_struct_inst_pruning_complains_if_no_mapping() {
+        let (indexer, _db) = Indexer::new_for_testing(&MIGRATIONS).await;
+        let mut conn = indexer.db().connect().await.unwrap();
+        let ev_struct_inst = EvStructInst::default();
+
+        let result = ev_struct_inst.prune(0, 2, &mut conn).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "No checkpoint mapping found for checkpoint 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ev_struct_inst_process_no_events() {
+        let (indexer, _db) = Indexer::new_for_testing(&MIGRATIONS).await;
+        let mut conn = indexer.db().connect().await.unwrap();
+        let ev_struct_inst = EvStructInst::default();
+
+        let checkpoint = Arc::new(
+            TestCheckpointDataBuilder::new(0)
+                .start_transaction(0)
+                .finish_transaction()
+                .build_checkpoint(),
+        );
+
+        let values = ev_struct_inst.process(&checkpoint).unwrap();
+        EvStructInst::commit(&values, &mut conn).await.unwrap();
+
+        assert_eq!(values.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_ev_struct_inst_process_single_event() {
+        let (indexer, _db) = Indexer::new_for_testing(&MIGRATIONS).await;
+        let mut conn = indexer.db().connect().await.unwrap();
+        let ev_struct_inst = EvStructInst::default();
+
+        let checkpoint = Arc::new(
+            TestCheckpointDataBuilder::new(0)
+                .start_transaction(0)
+                .with_events(vec![Event::random_for_testing()])
+                .finish_transaction()
+                .build_checkpoint(),
+        );
+
+        // Process checkpoint with one event
+        let values = ev_struct_inst.process(&checkpoint).unwrap();
+        EvStructInst::commit(&values, &mut conn).await.unwrap();
+
+        let events = get_all_ev_struct_inst(&mut conn).await.unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_ev_struct_inst_prune_events() {
+        let (indexer, _db) = Indexer::new_for_testing(&MIGRATIONS).await;
+        let mut conn = indexer.db().connect().await.unwrap();
+        let ev_struct_inst = EvStructInst::default();
+        // This is needed for ev_emit_mod pruning
+        let cp_mapping = CpSequenceNumbers::default();
+
+        let mut builder = TestCheckpointDataBuilder::new(0);
+        builder = builder.start_transaction(0).finish_transaction();
+        let checkpoint = Arc::new(builder.build_checkpoint());
+        let values = ev_struct_inst.process(&checkpoint).unwrap();
+        EvStructInst::commit(&values, &mut conn).await.unwrap();
+        let values = cp_mapping.process(&checkpoint).unwrap();
+        CpSequenceNumbers::commit(&values, &mut conn).await.unwrap();
+
+        builder = builder
+            .start_transaction(0)
+            .with_events(vec![Event::random_for_testing()])
+            .finish_transaction();
+        let checkpoint = Arc::new(builder.build_checkpoint());
+        let values = ev_struct_inst.process(&checkpoint).unwrap();
+        EvStructInst::commit(&values, &mut conn).await.unwrap();
+        let values = cp_mapping.process(&checkpoint).unwrap();
+        CpSequenceNumbers::commit(&values, &mut conn).await.unwrap();
+
+        builder = builder
+            .start_transaction(0)
+            .with_events(vec![
+                Event::random_for_testing(),
+                Event::random_for_testing(),
+            ])
+            .finish_transaction();
+        let checkpoint = Arc::new(builder.build_checkpoint());
+        let values = ev_struct_inst.process(&checkpoint).unwrap();
+        EvStructInst::commit(&values, &mut conn).await.unwrap();
+        let values = cp_mapping.process(&checkpoint).unwrap();
+        CpSequenceNumbers::commit(&values, &mut conn).await.unwrap();
+
+        // Test pruning
+        let rows_pruned = ev_struct_inst.prune(0, 2, &mut conn).await.unwrap();
+        assert_eq!(rows_pruned, 1);
+
+        let remaining_events = get_all_ev_struct_inst(&mut conn).await.unwrap();
+        assert_eq!(remaining_events.len(), 2);
     }
 }
