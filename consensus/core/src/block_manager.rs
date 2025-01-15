@@ -84,9 +84,12 @@ impl BlockManager {
     /// Tries to accept the provided blocks assuming that all their causal history exists. The method
     /// returns all the blocks that have been successfully processed in round ascending order, that includes also previously
     /// suspended blocks that have now been able to get accepted. Method also returns a set with the missing ancestor blocks.
+    /// When the `commit_sync_gc_round_override` is > 0 then the method will skip any missing ancestors that are <= `commit_sync_gc_round_override` round. This
+    /// is a special handling case when we are processing blocks via the committed sub dags.
     pub(crate) fn try_accept_blocks(
         &mut self,
         mut blocks: Vec<VerifiedBlock>,
+        commit_sync_gc_round_override: Round,
     ) -> (Vec<VerifiedBlock>, BTreeSet<BlockRef>) {
         let _s = monitored_scope("BlockManager::try_accept_blocks");
 
@@ -104,7 +107,7 @@ impl BlockManager {
 
             // Try to accept the input block.
             let block_ref = block.reference();
-            let block = match self.try_accept_one_block(block) {
+            let block = match self.try_accept_one_block(block, commit_sync_gc_round_override) {
                 TryAcceptResult::Accepted(block) => block,
                 TryAcceptResult::Suspended(ancestors_to_fetch) => {
                     debug!(
@@ -121,8 +124,10 @@ impl BlockManager {
             let unsuspended_blocks = self.try_unsuspend_children_blocks(block.reference());
 
             // Verify block timestamps
-            let blocks_to_accept = self
-                .verify_block_timestamps_and_accept(iter::once(block).chain(unsuspended_blocks));
+            let blocks_to_accept = self.verify_block_timestamps_and_accept(
+                iter::once(block).chain(unsuspended_blocks),
+                commit_sync_gc_round_override,
+            );
             accepted_blocks.extend(blocks_to_accept);
         }
 
@@ -150,10 +155,14 @@ impl BlockManager {
     fn verify_block_timestamps_and_accept(
         &mut self,
         unsuspended_blocks: impl IntoIterator<Item = VerifiedBlock>,
+        commit_sync_gc_round_override: Round,
     ) -> Vec<VerifiedBlock> {
         let (gc_enabled, gc_round) = {
             let dag_state = self.dag_state.read();
-            (dag_state.gc_enabled(), dag_state.gc_round())
+            (
+                dag_state.gc_enabled(),
+                dag_state.gc_round().max(commit_sync_gc_round_override),
+            )
         };
         // Try to verify the block and its children for timestamp, with ancestor blocks.
         let mut blocks_to_accept: BTreeMap<BlockRef, VerifiedBlock> = BTreeMap::new();
@@ -245,12 +254,17 @@ impl BlockManager {
     /// Tries to accept the provided block. To accept a block its ancestors must have been already successfully accepted. If
     /// block is accepted then Some result is returned. None is returned when either the block is suspended or the block
     /// has been already accepted before.
-    fn try_accept_one_block(&mut self, block: VerifiedBlock) -> TryAcceptResult {
+    fn try_accept_one_block(
+        &mut self,
+        block: VerifiedBlock,
+        commit_sync_gc_round_override: Round,
+    ) -> TryAcceptResult {
         let block_ref = block.reference();
         let mut missing_ancestors = BTreeSet::new();
         let mut ancestors_to_fetch = BTreeSet::new();
         let dag_state = self.dag_state.read();
-        let gc_round = dag_state.gc_round();
+        // We use the max of the gc_round and the commit_sync_gc_round_override to determine the gc_round for this block.
+        let gc_round = dag_state.gc_round().max(commit_sync_gc_round_override);
         let gc_enabled = dag_state.gc_enabled();
 
         // If block has been already received and suspended, or already processed and stored, or is a genesis block, then skip it.
@@ -468,7 +482,7 @@ impl BlockManager {
             });
 
             // Now validate their timestamps and accept them
-            let accepted_blocks = self.verify_block_timestamps_and_accept(unsuspended_blocks);
+            let accepted_blocks = self.verify_block_timestamps_and_accept(unsuspended_blocks, 0);
             for block in accepted_blocks {
                 let hostname = self
                     .context
@@ -603,7 +617,7 @@ mod tests {
             .collect::<Vec<VerifiedBlock>>();
 
         // WHEN
-        let (accepted_blocks, missing) = block_manager.try_accept_blocks(round_2_blocks.clone());
+        let (accepted_blocks, missing) = block_manager.try_accept_blocks(round_2_blocks.clone(), 0);
 
         // THEN
         assert!(accepted_blocks.is_empty());
@@ -657,7 +671,8 @@ mod tests {
             .take_while(|(_, block)| block.round() >= 2)
         {
             // WHEN
-            let (accepted_blocks, missing) = block_manager.try_accept_blocks(vec![block.clone()]);
+            let (accepted_blocks, missing) =
+                block_manager.try_accept_blocks(vec![block.clone()], 0);
 
             // THEN
             assert!(accepted_blocks.is_empty());
@@ -685,7 +700,7 @@ mod tests {
         let all_blocks = dag_builder.blocks.values().cloned().collect::<Vec<_>>();
 
         // WHEN
-        let (accepted_blocks, missing) = block_manager.try_accept_blocks(all_blocks.clone());
+        let (accepted_blocks, missing) = block_manager.try_accept_blocks(all_blocks.clone(), 0);
 
         // THEN
         assert_eq!(accepted_blocks.len(), 8);
@@ -701,7 +716,7 @@ mod tests {
         assert!(block_manager.is_empty());
 
         // WHEN trying to accept same blocks again, then none will be returned as those have been already accepted
-        let (accepted_blocks, _) = block_manager.try_accept_blocks(all_blocks);
+        let (accepted_blocks, _) = block_manager.try_accept_blocks(all_blocks, 0);
         assert!(accepted_blocks.is_empty());
     }
 
@@ -782,7 +797,8 @@ mod tests {
             // WHEN
             let mut reversed_blocks = all_blocks.clone();
             reversed_blocks.sort_by_key(|b| std::cmp::Reverse(b.reference()));
-            let (mut accepted_blocks, missing) = block_manager.try_accept_blocks(reversed_blocks);
+            let (mut accepted_blocks, missing) =
+                block_manager.try_accept_blocks(reversed_blocks, 0);
             accepted_blocks.sort_by_key(|a| a.reference());
 
             // THEN
@@ -790,7 +806,7 @@ mod tests {
             assert!(missing.is_empty());
             assert!(block_manager.is_empty());
 
-            let (accepted_blocks, _) = block_manager.try_accept_blocks(all_blocks);
+            let (accepted_blocks, _) = block_manager.try_accept_blocks(all_blocks, 0);
             assert!(accepted_blocks.is_empty());
         }
     }
@@ -834,7 +850,7 @@ mod tests {
         let all_blocks = dag_builder.blocks.values().cloned().collect::<Vec<_>>();
 
         // WHEN
-        let (accepted_blocks, missing) = block_manager.try_accept_blocks(all_blocks.clone());
+        let (accepted_blocks, missing) = block_manager.try_accept_blocks(all_blocks.clone(), 0);
 
         // THEN
         assert!(accepted_blocks.is_empty());
@@ -879,7 +895,7 @@ mod tests {
             // WHEN
             let mut all_accepted_blocks = vec![];
             for block in &all_blocks {
-                let (accepted_blocks, _) = block_manager.try_accept_blocks(vec![block.clone()]);
+                let (accepted_blocks, _) = block_manager.try_accept_blocks(vec![block.clone()], 0);
 
                 all_accepted_blocks.extend(accepted_blocks);
             }
@@ -940,7 +956,7 @@ mod tests {
 
             // WHEN
             for block in &all_blocks {
-                let (accepted_blocks, _) = block_manager.try_accept_blocks(vec![block.clone()]);
+                let (accepted_blocks, _) = block_manager.try_accept_blocks(vec![block.clone()], 0);
                 assert!(accepted_blocks.is_empty());
             }
             assert!(!block_manager.is_empty());
@@ -1039,6 +1055,7 @@ mod tests {
                 .filter(|block| block.round() > 1)
                 .cloned()
                 .collect(),
+            0,
         );
 
         // Missing refs should all come from round 1.
@@ -1055,6 +1072,7 @@ mod tests {
                 .filter(|block| block.round() == 1)
                 .cloned()
                 .collect(),
+            0,
         );
 
         // Only round 1 and round 2 blocks should be accepted.

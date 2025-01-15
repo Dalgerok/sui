@@ -120,7 +120,9 @@ async fn test_randomized_dag_and_decision_sequence() {
                 .gen_range(1..=(all_blocks.len() - i));
             let chunk = &all_blocks[i..i + chunk_size];
 
-            let _ = authority_1.block_manager.try_accept_blocks(chunk.to_vec());
+            let _ = authority_1
+                .block_manager
+                .try_accept_blocks(chunk.to_vec(), 0);
             let sequence = authority_1.committer.try_decide(last_decided);
 
             if !sequence.is_empty() {
@@ -149,7 +151,9 @@ async fn test_randomized_dag_and_decision_sequence() {
                 .gen_range(1..=(all_blocks.len() - i));
             let chunk = &all_blocks[i..i + chunk_size];
 
-            let _ = authority_2.block_manager.try_accept_blocks(chunk.to_vec());
+            let _ = authority_2
+                .block_manager
+                .try_accept_blocks(chunk.to_vec(), 0);
             let sequence = authority_2.committer.try_decide(last_decided);
 
             if !sequence.is_empty() {

@@ -654,6 +654,7 @@ mod tests {
     }
 
     #[async_trait]
+    #[async_trait]
     impl CoreThreadDispatcher for FakeCoreThreadDispatcher {
         async fn add_blocks(
             &self,
@@ -662,6 +663,14 @@ mod tests {
             let block_refs = blocks.iter().map(|b| b.reference()).collect();
             self.blocks.lock().extend(blocks);
             Ok(block_refs)
+        }
+
+        async fn add_commit_synced_blocks(
+            &self,
+            _blocks: Vec<VerifiedBlock>,
+            _last_synced_committed_leader: Option<BlockRef>,
+        ) -> Result<BTreeSet<BlockRef>, CoreError> {
+            todo!()
         }
 
         async fn new_block(&self, _round: Round, _force: bool) -> Result<(), CoreError> {

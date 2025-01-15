@@ -411,6 +411,14 @@ mod test {
             unimplemented!()
         }
 
+        async fn add_commit_synced_blocks(
+            &self,
+            _blocks: Vec<VerifiedBlock>,
+            _last_synced_committed_leader: Option<BlockRef>,
+        ) -> Result<BTreeSet<BlockRef>, CoreError> {
+            unimplemented!()
+        }
+
         async fn new_block(&self, _round: Round, _force: bool) -> Result<(), CoreError> {
             unimplemented!()
         }

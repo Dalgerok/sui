@@ -157,6 +157,14 @@ mod tests {
             todo!()
         }
 
+        async fn add_commit_synced_blocks(
+            &self,
+            _blocks: Vec<VerifiedBlock>,
+            _last_synced_committed_leader: Option<BlockRef>,
+        ) -> Result<BTreeSet<BlockRef>, CoreError> {
+            todo!()
+        }
+
         async fn new_block(&self, round: Round, force: bool) -> Result<(), CoreError> {
             self.new_block_calls
                 .lock()

@@ -244,12 +244,33 @@ impl Core {
         blocks: Vec<VerifiedBlock>,
     ) -> ConsensusResult<BTreeSet<BlockRef>> {
         let _scope = monitored_scope("Core::add_blocks");
+        self.add_blocks_inner(blocks, None)
+    }
+
+    // Adds blocks that have been synced via the commit syncer. We do a special handling here as it's possible due to GC to have pruned causal history
+    // that might not be present in earlier committed sub dags, but still needed in order to be able to advance the commits. However, this history in practice is not essential
+    // for safety (never committed as part of any sub dag) but only for liveness and even in this case only temporarily needed until commits advance.
+    pub(crate) fn add_commit_synced_blocks(
+        &mut self,
+        blocks: Vec<VerifiedBlock>,
+        last_synced_committed_leader: Option<BlockRef>,
+    ) -> ConsensusResult<BTreeSet<BlockRef>> {
+        let _scope = monitored_scope("Core::add_commit_synced_blocks");
+        self.add_blocks_inner(blocks, last_synced_committed_leader)
+    }
+
+    fn add_blocks_inner(
+        &mut self,
+        blocks: Vec<VerifiedBlock>,
+        last_synced_committed_leader: Option<BlockRef>,
+    ) -> ConsensusResult<BTreeSet<BlockRef>> {
+        let _scope = monitored_scope("Core::add_blocks_inner");
         let _s = self
             .context
             .metrics
             .node_metrics
             .scope_processing_time
-            .with_label_values(&["Core::add_blocks"])
+            .with_label_values(&["Core::add_blocks_inner"])
             .start_timer();
         self.context
             .metrics
@@ -258,7 +279,14 @@ impl Core {
             .observe(blocks.len() as f64);
 
         // Try to accept them via the block manager
-        let (accepted_blocks, missing_block_refs) = self.block_manager.try_accept_blocks(blocks);
+        let commit_sync_gc_round_override = self.dag_state.read().calculate_gc_round(
+            last_synced_committed_leader
+                .map(|b| b.round)
+                .unwrap_or(GENESIS_ROUND),
+        );
+        let (accepted_blocks, missing_block_refs) = self
+            .block_manager
+            .try_accept_blocks(blocks, commit_sync_gc_round_override);
 
         if !accepted_blocks.is_empty() {
             debug!(
@@ -523,7 +551,7 @@ impl Core {
         // Accept the block into BlockManager and DagState.
         let (accepted_blocks, missing) = self
             .block_manager
-            .try_accept_blocks(vec![verified_block.clone()]);
+            .try_accept_blocks(vec![verified_block.clone()], 0);
         assert_eq!(accepted_blocks.len(), 1);
         assert!(missing.is_empty());
 
