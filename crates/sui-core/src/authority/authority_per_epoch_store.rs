@@ -66,8 +66,8 @@ use sui_types::sui_system_state::epoch_start_sui_system_state::{
 };
 use sui_types::transaction::{
     AuthenticatorStateUpdate, CertifiedTransaction, InputObjectKind, SenderSignedData, Transaction,
-    TransactionKey, TransactionKind, VerifiedCertificate, VerifiedSignedTransaction,
-    VerifiedTransaction,
+    TransactionDataAPI, TransactionKey, TransactionKind, VerifiedCertificate,
+    VerifiedSignedTransaction, VerifiedTransaction,
 };
 use tap::TapOptional;
 use tokio::sync::OnceCell;
@@ -2249,7 +2249,7 @@ impl AuthorityPerEpochStore {
         assert_eq!(transactions.len(), digests.len());
 
         let signatures: Vec<_> = {
-            let mut user_sigs = self.user_signatures_for_checkpoints.write();
+            let mut user_sigs = self.user_signatures_for_checkpoints.lock();
             digests.iter().map(|d| user_sigs.remove(d)).collect()
         };
 
@@ -2475,7 +2475,7 @@ impl AuthorityPerEpochStore {
         signatures: Vec<GenericSignature>,
     ) {
         self.user_signatures_for_checkpoints
-            .write()
+            .lock()
             .insert(digest, signatures);
         let key = ConsensusTransactionKey::Certificate(digest);
         let key = SequencedConsensusTransactionKey::External(key);
@@ -2500,7 +2500,7 @@ impl AuthorityPerEpochStore {
         &self,
         certificates: &[VerifiedExecutableTransaction],
     ) -> SuiResult {
-        let mut user_sigs = self.user_signatures_for_checkpoints.write();
+        let mut user_sigs = self.user_signatures_for_checkpoints.lock();
         for certificate in certificates {
             // User signatures are written in the same batch as consensus certificate processed flag,
             // which means we won't attempt to insert this twice for the same tx digest
