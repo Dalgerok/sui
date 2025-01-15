@@ -7,6 +7,8 @@ use crate::execution_cache::ExecutionCacheTraitPointers;
 use crate::execution_cache::TransactionCacheRead;
 use crate::jsonrpc_index::CoinIndexKey2;
 use crate::rpc_index::RpcIndexStore;
+use crate::traffic_controller::metrics::TrafficControllerMetrics;
+use crate::traffic_controller::TrafficController;
 use crate::transaction_outputs::TransactionOutputs;
 use crate::verify_indexes::verify_indexes;
 use anyhow::anyhow;
@@ -56,6 +58,8 @@ use sui_types::layout_resolver::into_struct_layout;
 use sui_types::layout_resolver::LayoutResolver;
 use sui_types::messages_consensus::{AuthorityCapabilitiesV1, AuthorityCapabilitiesV2};
 use sui_types::object::bounded_visitor::BoundedVisitor;
+use sui_types::traffic_control::PolicyConfig;
+use sui_types::traffic_control::RemoteFirewallConfig;
 use sui_types::transaction_executor::SimulateTransactionResult;
 use tap::TapFallible;
 use tokio::sync::mpsc::unbounded_channel;
@@ -825,6 +829,9 @@ pub struct AuthorityState {
 
     /// The chain identifier is derived from the digest of the genesis checkpoint.
     chain_identifier: ChainIdentifier,
+
+    /// Traffic controller for Sui core servers (json-rpc, validator service)
+    pub traffic_controller: Option<Arc<TrafficController>>,
 }
 
 /// The authority state encapsulates all state, drives execution, and ensures safety.
@@ -1489,6 +1496,22 @@ impl AuthorityState {
                 .observe(effects.gas_cost_summary().computation_cost as f64 / elapsed);
         };
         Ok((effects, execution_error_opt))
+    }
+
+    pub fn reconfigure_traffic_control(
+        &self,
+        error_threshold: Option<u64>,
+        spam_threshold: Option<u64>,
+        dry_run: Option<bool>,
+    ) -> SuiResult<()> {
+        self.traffic_controller
+            .as_ref()
+            .map(|traffic_controller| {
+                traffic_controller.reconfigure_no_clear(error_threshold, spam_threshold, dry_run)
+            })
+            .unwrap_or(Err(SuiError::InvalidAdminRequest(
+                "traffic controller not enabled".to_string(),
+            )))
     }
 
     #[instrument(level = "trace", skip_all)]
@@ -2863,6 +2886,8 @@ impl AuthorityState {
         archive_readers: ArchiveReaderBalancer,
         validator_tx_finalizer: Option<Arc<ValidatorTxFinalizer<NetworkAuthorityClient>>>,
         chain_identifier: ChainIdentifier,
+        policy_config: Option<PolicyConfig>,
+        firewall_config: Option<RemoteFirewallConfig>,
     ) -> Arc<Self> {
         Self::check_protocol_version(supported_protocol_versions, epoch_store.protocol_version());
 
@@ -2898,6 +2923,14 @@ impl AuthorityState {
         let input_loader =
             TransactionInputLoader::new(execution_cache_trait_pointers.object_cache_reader.clone());
         let epoch = epoch_store.epoch();
+        let traffic_controller_metrics = TrafficControllerMetrics::new(prometheus_registry);
+        let traffic_controller = policy_config.clone().map(|policy| {
+            Arc::new(TrafficController::init(
+                policy,
+                traffic_controller_metrics,
+                firewall_config.clone(),
+            ))
+        });
         let state = Arc::new(AuthorityState {
             name,
             secret,
@@ -2920,6 +2953,7 @@ impl AuthorityState {
             overload_info: AuthorityOverloadInfo::default(),
             validator_tx_finalizer,
             chain_identifier,
+            traffic_controller,
         });
 
         // Start a task to execute ready certificates.

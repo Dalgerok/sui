@@ -675,6 +675,9 @@ pub enum SuiError {
 
     #[error("The request did not contain a certificate")]
     NoCertificateProvidedError,
+
+    #[error("Invalid admin request: {0}")]
+    InvalidAdminRequest(String),
 }
 
 #[repr(u64)]
