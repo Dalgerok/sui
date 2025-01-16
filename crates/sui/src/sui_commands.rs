@@ -674,6 +674,12 @@ async fn start(
             None => NonZeroUsize::new(DEFAULT_NUMBER_OF_AUTHORITIES),
         }
         .ok_or_else(|| anyhow!("Committee size must be at least 1."))?;
+        let config_dir = if let Some(config_dir) = config {
+            swarm_builder = swarm_builder.dir(config_dir.join("sui").join("db"));
+            config_dir.join("sui").join("config")
+        } else {
+            tempdir()?.into_path()
+        };
         swarm_builder = swarm_builder.committee_size(committee_size);
         let genesis_config = GenesisConfig::custom_genesis(1, 100);
         swarm_builder = swarm_builder.with_genesis_config(genesis_config);
